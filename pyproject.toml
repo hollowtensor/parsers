@@ -16,7 +16,7 @@ dependencies = [
 [project.optional-dependencies]
 docling = ["docling"]
 tesseract = ["pytesseract", "Pillow"]
-vlm = ["openai", "httpx"]
+vlm = ["httpx", "pymupdf"]
 extraction = ["dspy-ai", "openai"]
 all = ["parsers[docling,tesseract,vlm,extraction]"]
 dev = [

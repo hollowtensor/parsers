@@ -35,3 +35,6 @@ htmlcov/
 
 # Logs
 *.log
+
+# Cloned model repos (run these on GPU machines, not here)
+DeepSeek-OCR-2/
