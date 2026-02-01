@@ -9,64 +9,99 @@ from parsers.core.document import BoundingBox, Document, Page, TextBlock
 from parsers.core.registry import ParserRegistry
 from parsers.methods.vlm.base import BaseVLMParser
 
-# Prompt templates from the official DeepSeek-OCR-2 repo
+# Prompt templates from the official DeepSeek-OCR-2 repo + HF demo
 PROMPTS = {
     "document": "<|grounding|>Convert the document to markdown.",
     "ocr": "Free OCR.",
+    "describe": "Describe this image in detail.",
 }
 
-# Regex for grounding annotations: <|ref|>label<|/ref|><|det|>coords<|/det|>
+# Locate mode is special — the query text is interpolated at runtime
+_LOCATE_TEMPLATE = "Locate <|ref|>{query}<|/ref|> in the image."
+
+# Regex: <|ref|>label<|/ref|><|det|>coords<|/det|> followed by content until next tag or end
 _GROUNDING_RE = re.compile(
     r"<\|ref\|>(.*?)<\|/ref\|><\|det\|>(.*?)<\|/det\|>", re.DOTALL
 )
 
-# Tokens the model may emit that we want to strip from final text
+# Splits text into (tag, content) pairs — tag comes before its content
+_BLOCK_SPLIT_RE = re.compile(
+    r"(<\|ref\|>.*?<\|/ref\|><\|det\|>.*?<\|/det\|>)", re.DOTALL
+)
+
+# Tokens the model may emit that we want to strip
 _STRIP_TOKENS = {"<｜end▁of▁sentence｜>"}
+
+
+def _parse_bbox(
+    coords_raw: str, page_width: float | None, page_height: float | None
+) -> BoundingBox | None:
+    """Parse a coordinate string like [[x1,y1,x2,y2]] into a BoundingBox."""
+    try:
+        coord_lists = eval(coords_raw)
+    except Exception:
+        return None
+    if not coord_lists or len(coord_lists[0]) != 4:
+        return None
+    x0, y0, x1, y1 = coord_lists[0]
+    return BoundingBox(
+        x0=x0 / 999 * page_width if page_width else x0,
+        y0=y0 / 999 * page_height if page_height else y0,
+        x1=x1 / 999 * page_width if page_width else x1,
+        y1=y1 / 999 * page_height if page_height else y1,
+    )
+
+
+def _clean(text: str) -> str:
+    for tok in _STRIP_TOKENS:
+        text = text.replace(tok, "")
+    # LaTeX artifacts the model sometimes emits
+    text = text.replace("\\coloneqq", ":=").replace("\\eqqcolon", "=:")
+    return text.strip()
 
 
 def _parse_grounding(raw_text: str, page_width: float | None, page_height: float | None):
     """Parse DeepSeek-OCR-2 grounding output into blocks + cleaned markdown.
 
+    Output format: each grounding tag precedes its content:
+        <|ref|>type<|/ref|><|det|>[[coords]]<|/det|>
+        content text here ...
+
     Returns (cleaned_text, list[TextBlock]).
     """
+    raw_text = _clean(raw_text)
+    parts = _BLOCK_SPLIT_RE.split(raw_text)
+
     blocks: list[TextBlock] = []
-    cleaned = raw_text
+    cleaned_parts: list[str] = []
+    pending_label: str | None = None
+    pending_bbox: BoundingBox | None = None
 
-    for tok in _STRIP_TOKENS:
-        cleaned = cleaned.replace(tok, "")
+    for part in parts:
+        tag_match = _GROUNDING_RE.fullmatch(part)
+        if tag_match:
+            # This is a grounding tag — stash label + bbox for the next content part
+            pending_label = tag_match.group(1).strip()
+            pending_bbox = _parse_bbox(tag_match.group(2).strip(), page_width, page_height)
+        else:
+            # This is content text
+            content = part.strip()
+            if pending_label is not None and content:
+                block_type = pending_label if pending_label != "image" else "figure"
+                blocks.append(TextBlock(
+                    text=content,
+                    bbox=pending_bbox,
+                    block_type=block_type,
+                ))
+                cleaned_parts.append(content)
+                pending_label = None
+                pending_bbox = None
+            elif content:
+                # Text before any grounding tag
+                blocks.append(TextBlock(text=content))
+                cleaned_parts.append(content)
 
-    for match in _GROUNDING_RE.finditer(raw_text):
-        label = match.group(1).strip()
-        coords_raw = match.group(2).strip()
-
-        # Parse coordinate list — format: [[x1,y1,x2,y2], ...]
-        try:
-            coord_lists = eval(coords_raw)  # safe-ish: model output is numeric lists
-        except Exception:
-            coord_lists = []
-
-        for coords in coord_lists:
-            if len(coords) != 4:
-                continue
-            x0, y0, x1, y1 = coords
-
-            # Coords are normalised 0-999; convert to absolute if we know dimensions
-            bbox = BoundingBox(
-                x0=x0 / 999 * page_width if page_width else x0,
-                y0=y0 / 999 * page_height if page_height else y0,
-                x1=x1 / 999 * page_width if page_width else x1,
-                y1=y1 / 999 * page_height if page_height else y1,
-            )
-
-            block_type = label if label != "image" else "figure"
-            blocks.append(TextBlock(text=label, bbox=bbox, block_type=block_type))
-
-    # Remove grounding tags from the cleaned markdown
-    cleaned = _GROUNDING_RE.sub("", cleaned)
-    for tok in _STRIP_TOKENS:
-        cleaned = cleaned.replace(tok, "")
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n\n".join(cleaned_parts)).strip()
     return cleaned, blocks
 
 
@@ -89,19 +124,24 @@ class DeepSeekOCRParser(BaseVLMParser):
         api_key: str = "EMPTY",
         model: str = "deepseek-ai/DeepSeek-OCR-2",
         prompt_mode: str = "document",
+        locate_query: str | None = None,
         max_tokens: int = 8192,
         temperature: float = 0.0,
-        pdf_dpi: int = 144,
+        pdf_dpi: int = 300,
         **kwargs,
     ) -> None:
         super().__init__(model=model, api_key=api_key, base_url=base_url, **kwargs)
         self.prompt_mode = prompt_mode
+        self.locate_query = locate_query
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.pdf_dpi = pdf_dpi
 
     @property
     def _prompt_text(self) -> str:
+        if self.prompt_mode == "locate":
+            query = self.locate_query or "text"
+            return _LOCATE_TEMPLATE.format(query=query)
         return PROMPTS.get(self.prompt_mode, PROMPTS["document"])
 
     def _build_message(self, image_b64: str, mime: str = "image/png") -> list[dict]:
