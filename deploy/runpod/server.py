@@ -1,15 +1,27 @@
 """
 OpenAI-compatible API server for DeepSeek-OCR-2 on vLLM.
 
-Place this file inside:
+This file must live inside the DeepSeek-OCR-2 vLLM directory because it
+imports local modules (deepseek_ocr2, process/, config).  The setup.sh
+script copies it there automatically.
+
     DeepSeek-OCR-2/DeepSeek-OCR2-master/DeepSeek-OCR2-vllm/server.py
 
-Then run:
-    python server.py                         # defaults
-    python server.py --port 8000 --gpu-mem 0.9   # custom
+Start:
+    python server.py                                    # defaults (port 8000)
+    python server.py --port 8000 --gpu-mem 0.9          # custom
+    nohup python server.py > /workspace/server.log 2>&1 &  # background
 
-The server exposes POST /v1/chat/completions that accepts images
-as base64 data-URIs, matching the OpenAI vision API format.
+Endpoints:
+    POST /v1/chat/completions   OpenAI-compatible (images as base64 data-URIs)
+    GET  /v1/models             List served model
+    GET  /health                Health check
+
+Tested:
+    GPU   : RTX 4090 24 GB  (any ≥20 GB works; model uses ~6.3 GB)
+    CUDA  : 12.4 / 11.8
+    vLLM  : 0.8.5
+    Python: 3.11
 """
 
 from __future__ import annotations
