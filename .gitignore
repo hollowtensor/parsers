@@ -38,3 +38,14 @@ htmlcov/
 
 # Cloned model repos (run these on GPU machines, not here)
 DeepSeek-OCR-2/
+
+# Reference HuggingFace demos (not part of this project)
+DeepSeek-OCR-Demo/
+LightOnOCR-2-1B-Demo/
+
+# Test artifacts
+parsed_output.*
+*.pdf
+*.jpg
+*.jpeg
+*.png

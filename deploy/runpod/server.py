@@ -13,7 +13,8 @@ Start:
     nohup python server.py > /workspace/server.log 2>&1 &  # background
 
 Endpoints:
-    POST /v1/chat/completions   OpenAI-compatible (images as base64 data-URIs)
+    POST /v1/chat/completions   OpenAI-compatible, single image
+    POST /v1/batch              Batch endpoint — multiple images in one call
     GET  /v1/models             List served model
     GET  /health                Health check
 
@@ -32,6 +33,7 @@ import io
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 import torch
@@ -245,6 +247,94 @@ async def chat_completions(req: ChatRequest):
             completion_tokens=len(outputs[0].outputs[0].token_ids),
             total_tokens=len(outputs[0].prompt_token_ids) + len(outputs[0].outputs[0].token_ids),
         ),
+    )
+
+
+# ── Batch endpoint ──────────────────────────────────────────────────
+class BatchItem(BaseModel):
+    image: str  # base64 data-URI: "data:image/png;base64,..."
+    prompt: str = "<|grounding|>Convert the document to markdown."
+
+
+class BatchRequest(BaseModel):
+    items: list[BatchItem]
+    max_tokens: int = 8192
+    temperature: float = 0.0
+
+
+class BatchResultItem(BaseModel):
+    index: int
+    text: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
+class BatchResponse(BaseModel):
+    results: list[BatchResultItem]
+    total_time_ms: int = 0
+
+
+def _decode_image(data_uri: str) -> Image.Image:
+    """Decode a base64 data-URI to a PIL Image."""
+    b64_data = data_uri.split(",", 1)[1] if "," in data_uri else data_uri
+    raw = base64.b64decode(b64_data)
+    image = Image.open(io.BytesIO(raw)).convert("RGB")
+    try:
+        image = ImageOps.exif_transpose(image)
+    except Exception:
+        pass
+    return image
+
+
+def _preprocess_single(item: BatchItem) -> dict:
+    """Preprocess one batch item into a vLLM request dict."""
+    image = _decode_image(item.image)
+    prompt = f"<image>\n{item.prompt}"
+    image_features = processor.tokenize_with_images(
+        images=[image], bos=True, eos=True, cropping=CROP_MODE
+    )
+    return {
+        "prompt": prompt,
+        "multi_modal_data": {"image": image_features},
+    }
+
+
+@app.post("/v1/batch", response_model=BatchResponse)
+async def batch_completions(req: BatchRequest):
+    """Process multiple images in a single batched vLLM generate() call."""
+    if llm is None or sampling_params is None or processor is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet")
+
+    t0 = time.time()
+
+    # Preprocess images in parallel (CPU-bound resize/tokenize)
+    with ThreadPoolExecutor(max_workers=min(len(req.items), 16)) as pool:
+        batch_inputs = list(pool.map(_preprocess_single, req.items))
+
+    sp = SamplingParams(
+        temperature=req.temperature,
+        max_tokens=req.max_tokens,
+        logits_processors=sampling_params.logits_processors,
+        skip_special_tokens=False,
+        include_stop_str_in_output=True,
+    )
+
+    # Single batched generate call — vLLM processes all pages concurrently on GPU
+    outputs = llm.generate(batch_inputs, sampling_params=sp)
+
+    results = []
+    for idx, output in enumerate(outputs):
+        text = output.outputs[0].text.replace("<｜end▁of▁sentence｜>", "")
+        results.append(BatchResultItem(
+            index=idx,
+            text=text,
+            prompt_tokens=len(output.prompt_token_ids),
+            completion_tokens=len(output.outputs[0].token_ids),
+        ))
+
+    return BatchResponse(
+        results=results,
+        total_time_ms=int((time.time() - t0) * 1000),
     )
 
 

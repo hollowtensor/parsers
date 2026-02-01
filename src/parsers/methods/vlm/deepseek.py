@@ -127,7 +127,10 @@ class DeepSeekOCRParser(BaseVLMParser):
         locate_query: str | None = None,
         max_tokens: int = 8192,
         temperature: float = 0.0,
-        pdf_dpi: int = 300,
+        pdf_dpi: int = 150,
+        batch_size: int = 8,
+        retries: int = 3,
+        retry_delay: float = 2.0,
         **kwargs,
     ) -> None:
         super().__init__(model=model, api_key=api_key, base_url=base_url, **kwargs)
@@ -136,6 +139,9 @@ class DeepSeekOCRParser(BaseVLMParser):
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.pdf_dpi = pdf_dpi
+        self.batch_size = batch_size
+        self.retries = retries
+        self.retry_delay = retry_delay
 
     @property
     def _prompt_text(self) -> str:
@@ -160,40 +166,87 @@ class DeepSeekOCRParser(BaseVLMParser):
         ]
 
     def _call_server(self, image_b64: str, mime: str = "image/png") -> str:
-        """Send a single image to the vLLM server and return raw text."""
+        """Send a single image to the vLLM server and return raw text.
+
+        Retries on transient errors (SSL, connection, timeout).
+        """
+        import time
         import httpx
 
-        resp = httpx.post(
-            f"{self.base_url}/chat/completions",
-            json={
-                "model": self.model,
-                "messages": self._build_message(image_b64, mime),
-                "max_tokens": self.max_tokens,
-                "temperature": self.temperature,
-            },
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            timeout=300.0,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        last_exc: Exception | None = None
+        for attempt in range(1, self.retries + 1):
+            try:
+                resp = httpx.post(
+                    f"{self.base_url}/chat/completions",
+                    json={
+                        "model": self.model,
+                        "messages": self._build_message(image_b64, mime),
+                        "max_tokens": self.max_tokens,
+                        "temperature": self.temperature,
+                    },
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=300.0,
+                )
+                resp.raise_for_status()
+                return resp.json()["choices"][0]["message"]["content"]
+            except (httpx.ReadError, httpx.ConnectError, httpx.TimeoutException) as exc:
+                last_exc = exc
+                if attempt < self.retries:
+                    time.sleep(self.retry_delay * attempt)
+        raise last_exc  # type: ignore[misc]
 
-    async def _acall_server(self, image_b64: str, mime: str = "image/png") -> str:
-        """Async variant of _call_server."""
+    def _call_batch(self, images_b64: list[str], mime: str = "image/png") -> list[str]:
+        """Send images in chunked batch requests. Returns list of raw texts in order."""
         import httpx
 
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            resp = await client.post(
-                f"{self.base_url}/chat/completions",
+        all_results: list[str] = []
+        for i in range(0, len(images_b64), self.batch_size):
+            chunk = images_b64[i : i + self.batch_size]
+            items = [
+                {"image": f"data:{mime};base64,{b64}", "prompt": self._prompt_text}
+                for b64 in chunk
+            ]
+            resp = httpx.post(
+                f"{self.base_url}/batch",
                 json={
-                    "model": self.model,
-                    "messages": self._build_message(image_b64, mime),
+                    "items": items,
                     "max_tokens": self.max_tokens,
                     "temperature": self.temperature,
                 },
                 headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=600.0,
             )
             resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
+            data = resp.json()
+            all_results.extend(r["text"] for r in data["results"])
+        return all_results
+
+    async def _acall_server(self, image_b64: str, mime: str = "image/png") -> str:
+        """Async variant of _call_server with retries."""
+        import asyncio
+        import httpx
+
+        last_exc: Exception | None = None
+        for attempt in range(1, self.retries + 1):
+            try:
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    resp = await client.post(
+                        f"{self.base_url}/chat/completions",
+                        json={
+                            "model": self.model,
+                            "messages": self._build_message(image_b64, mime),
+                            "max_tokens": self.max_tokens,
+                            "temperature": self.temperature,
+                        },
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                    )
+                    resp.raise_for_status()
+                    return resp.json()["choices"][0]["message"]["content"]
+            except (httpx.ReadError, httpx.ConnectError, httpx.TimeoutException) as exc:
+                last_exc = exc
+                if attempt < self.retries:
+                    await asyncio.sleep(self.retry_delay * attempt)
+        raise last_exc  # type: ignore[misc]
 
     # ── Sync ────────────────────────────────────────────────────────────
 
@@ -231,11 +284,9 @@ class DeepSeekOCRParser(BaseVLMParser):
         for idx, (img_bytes, (pw, ph)) in enumerate(zip(page_images, dims)):
             b64 = self._encode_bytes(img_bytes)
             raw = self._call_server(b64, "image/png")
-
             cleaned, blocks = _parse_grounding(raw, pw, ph)
             if not blocks:
                 blocks = [TextBlock(text=cleaned)]
-
             pages.append(Page(page_number=idx + 1, width=pw, height=ph, blocks=blocks))
 
         return Document(
